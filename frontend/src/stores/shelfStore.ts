@@ -1,7 +1,8 @@
 import { defineStore } from 'pinia'
-import { computed, ref } from 'vue'
+import { computed, ref, shallowRef, triggerRef } from 'vue'
 import { db, readUiPrefs, writeUiPrefs } from '@/utils/db'
 import { useIdbTable } from '@/hooks/useIdbTable'
+import { runShelfMutation } from '@/utils/shelfTransaction'
 import {
   createEmptyShelfFilter,
   TEMP_ZONES,
@@ -24,8 +25,18 @@ export interface NewShelfInput {
 }
 
 /**
- * 熟成库窖位 store：维护货架列表、占用率派生值、当前选中库房与上架分配。
- * 上架时校验窖位余量并实时更新 occupied。
+ * 乐观占位：提交前在本标签页先扣一块余量，防止同一页连续点击/两个弹窗重复选择同一格。
+ * 跨标签页的真实互斥由 IndexedDB 事务保证；占位失败（事务中止）时必须调用 releaseHold 释放。
+ */
+export interface ShelfHold {
+  shelfId: string
+  /** 换架时原窖位，释放占位时无需处理原窖位（真实释放由事务完成），仅用于调试与提示 */
+  batchId: string
+}
+
+/**
+ * 熟成库窖位 store：维护货架列表、占用率派生值、当前选中库房、上/换/下架动作与本页占位。
+ * 占用率以批次表中真实挂接数为准；上 / 换 / 下架统一走 utils/shelfTransaction 的串行化事务。
  */
 export const useShelfStore = defineStore('shelf', () => {
   const shelvesTable = useIdbTable<Shelf>((database) => database.shelves, {
@@ -38,6 +49,10 @@ export const useShelfStore = defineStore('shelf', () => {
   const currentRoom = ref<string>(prefs.lastRoom ?? '')
   const currentShelfId = ref<string | null>(null)
 
+  /** 本标签页已预占、等待事务提交确认的窖位格（非响应式容器 + version 触发派生重算） */
+  const holds = shallowRef<Map<string, ShelfHold>>(new Map())
+  const holdsVersion = ref(0)
+
   const shelves = computed<Shelf[]>(() => shelvesTable.rows.value)
   const loading = computed(() => shelvesTable.loading.value)
   const ready = computed(() => shelvesTable.ready.value)
@@ -48,29 +63,43 @@ export const useShelfStore = defineStore('shelf', () => {
     Array.from(new Set(shelves.value.map((shelf) => shelf.room))).sort()
   )
 
-  /** 某窖位上的批次 */
+  /** 某窖位上的批次（以批次表当前挂接为准） */
   function batchesOfShelf(shelfId: string): Batch[] {
     return milkStore.batches.filter((batch) => batch.shelfId === shelfId)
   }
 
-  /** 占用率：以「实际挂接的批次数」与 occupied 字段中的较大者为准，避免脏数据导致占用率偏低 */
-  const occupancies = computed<ShelfOccupancy[]>(() =>
-    shelves.value.map((shelf) => {
-      const hosted = batchesOfShelf(shelf.id).length
-      const occupied = Math.max(shelf.occupied, hosted)
-      const free = Math.max(0, shelf.capacity - occupied)
-      const percent = shelf.capacity === 0 ? 100 : Math.round((occupied / shelf.capacity) * 100)
+  /**
+   * 占用率：occupied（真实挂接批次数）/ held（本页占位）/ free（真实余量）。
+   * occupied 直接取批次挂接数——shelf.occupied 只是缓存，看板不再用它参与余量计算，
+   * 只用来发现「少算一块」这类计数漂移并给出冲突标记。
+   */
+  const occupancies = computed<ShelfOccupancy[]>(() => {
+    // 依赖 holdsVersion，使占位获取/释放后派生值重算
+    void holdsVersion.value
+    return shelves.value.map((shelf) => {
+      const hosted = milkStore.batches.filter((batch) => batch.shelfId === shelf.id).length
+      const held = holds.value.has(shelf.id) ? 1 : 0
+      const effective = hosted + held
+      const free = Math.max(0, shelf.capacity - effective)
+      const percent =
+        shelf.capacity === 0 ? 100 : Math.min(100, Math.round((effective / shelf.capacity) * 100))
+      const overCapacity = hosted > shelf.capacity
+      const drift = shelf.occupied !== hosted
       return {
         shelfId: shelf.id,
         capacity: shelf.capacity,
-        occupied,
+        occupied: hosted,
+        held,
         free,
         percent,
         full: free === 0,
-        tight: percent >= 85
+        tight: percent >= 85 && !overCapacity,
+        overCapacity,
+        drift,
+        conflict: overCapacity || drift
       }
     })
-  )
+  })
 
   const occupancyMap = computed<Record<string, ShelfOccupancy>>(() => {
     const map: Record<string, ShelfOccupancy> = {}
@@ -106,7 +135,7 @@ export const useShelfStore = defineStore('shelf', () => {
   )
   const totalOccupied = computed(() =>
     filteredShelves.value.reduce(
-      (sum, shelf) => sum + (occupancyMap.value[shelf.id]?.occupied ?? shelf.occupied),
+      (sum, shelf) => sum + (occupancyMap.value[shelf.id]?.occupied ?? 0),
       0
     )
   )
@@ -116,10 +145,23 @@ export const useShelfStore = defineStore('shelf', () => {
   const fullShelfCount = computed(
     () => filteredShelves.value.filter((shelf) => occupancyMap.value[shelf.id]?.full).length
   )
+  /** 存在冲突（超占 / 计数漂移）的窖位数，供看板顶部告警 */
+  const conflictShelfCount = computed(
+    () => filteredShelves.value.filter((shelf) => occupancyMap.value[shelf.id]?.conflict).length
+  )
+  const conflictShelves = computed<Shelf[]>(() =>
+    filteredShelves.value.filter((shelf) => occupancyMap.value[shelf.id]?.conflict)
+  )
   /** 未上架的批次（可分配窖位） */
   const unassignedBatches = computed<Batch[]>(() =>
     milkStore.batches.filter(
       (batch) => !batch.shelfId && batch.state !== '已出库' && batch.state !== '报废'
+    )
+  )
+  /** 已上架、可换架的批次（终态批次不允许再换架） */
+  const assignedBatches = computed<Batch[]>(() =>
+    milkStore.batches.filter(
+      (batch) => batch.shelfId && batch.state !== '已出库' && batch.state !== '报废'
     )
   )
 
@@ -152,6 +194,47 @@ export const useShelfStore = defineStore('shelf', () => {
     filter.value = createEmptyShelfFilter()
   }
 
+  // ── 乐观占位 ───────────────────────────────────────────────────
+  /**
+   * 占位：提交事务前在本页先扣一块目标窖位余量。
+   * 已被本页其它弹窗占位或真实余量不足时返回 null（调用方据此提示并保留选择）。
+   */
+  function acquireHold(shelfId: string, batchId: string): ShelfHold | null {
+    const occupancy = occupancyMap.value[shelfId]
+    if (!occupancy) return null
+    if (holds.value.has(shelfId)) return null
+    if (occupancy.occupied >= occupancy.capacity) return null
+    const hold: ShelfHold = { shelfId, batchId }
+    const next = new Map(holds.value)
+    next.set(shelfId, hold)
+    holds.value = next
+    holdsVersion.value += 1
+    triggerRef(holds)
+    return hold
+  }
+
+  /** 释放占位：事务失败 / 取消 / 关闭弹窗时必须调用，失败操作不允许占着余量 */
+  function releaseHold(shelfId: string): void {
+    if (!holds.value.has(shelfId)) return
+    const next = new Map(holds.value)
+    next.delete(shelfId)
+    holds.value = next
+    holdsVersion.value += 1
+    triggerRef(holds)
+  }
+
+  /** 释放全部占位（页面卸载、弹窗重置兜底） */
+  function releaseAllHolds(): void {
+    if (holds.value.size === 0) return
+    holds.value = new Map()
+    holdsVersion.value += 1
+    triggerRef(holds)
+  }
+
+  function isHeld(shelfId: string): boolean {
+    return holds.value.has(shelfId)
+  }
+
   async function createShelf(payload: NewShelfInput): Promise<Shelf> {
     return shelvesTable.create({ ...payload }, 'shelf')
   }
@@ -160,101 +243,89 @@ export const useShelfStore = defineStore('shelf', () => {
     await shelvesTable.update(id, patch)
   }
 
-  /** 级联删除：窖位 → 解除批次挂接（批次本身保留） */
+  /** 级联删除：窖位 → 解除批次挂接（批次本身保留）；占用占位一并清理 */
   async function removeShelf(id: string): Promise<void> {
     await db.transaction('rw', [db.shelves, db.batches], async () => {
       const hosted = await db.batches.where('shelfId').equals(id).toArray()
+      const now = Date.now()
       for (const batch of hosted) {
-        await db.batches.update(batch.id, { shelfId: null, updatedAt: Date.now() })
+        await db.batches.update(batch.id, { shelfId: null, updatedAt: now })
       }
       await db.shelves.delete(id)
     })
+    releaseHold(id)
     if (currentShelfId.value === id) currentShelfId.value = null
   }
 
   /**
-   * 上架：校验窖位余量 → 更新 occupied → 回写批次 shelfId。
-   * 批次若已在别的窖位，会先从原窖位释放一块。
+   * 上架 / 换架统一入口：乐观占位 → 串行化事务内重新核对容量与批次当前位置 →
+   * 成功保留占位（提交即真实占用，本页占位被真实数据覆盖）；失败释放占位并回传冲突码。
+   *
+   * @param batchId          批次 id
+   * @param targetShelfId    目标窖位 id
+   * @param expectedShelfId  提交者看到的批次当前位置：上架传 null，换架传原窖位 id；
+   *                         缺省取 store 中该批次的当前挂接
    */
-  async function assignBatch(batchId: string, shelfId: string): Promise<ShelfAssignResult> {
-    const shelf = shelves.value.find((item) => item.id === shelfId)
-    if (!shelf) return { ok: false, message: '窖位不存在，请刷新后重试' }
+  async function assignBatch(
+    batchId: string,
+    targetShelfId: string,
+    expectedShelfId?: string | null
+  ): Promise<ShelfAssignResult> {
     const batch = milkStore.batches.find((item) => item.id === batchId)
-    if (!batch) return { ok: false, message: '批次不存在，请刷新后重试' }
+    if (!batch) return { ok: false, message: '批次不存在，请刷新后重试', code: 'BATCH_NOT_FOUND' }
     if (batch.state === '已出库' || batch.state === '报废') {
-      return { ok: false, message: `批次状态为「${batch.state}」，不能再上架` }
+      return { ok: false, message: `批次状态为「${batch.state}」，不能再上架`, code: 'BATCH_TERMINAL' }
     }
-    if (batch.shelfId === shelfId) return { ok: false, message: '该批次已在此窖位上' }
+    if (batch.shelfId === targetShelfId) {
+      return { ok: false, message: '该批次已在此窖位上', code: 'ALREADY_HERE' }
+    }
+    const fromShelfId = expectedShelfId === undefined ? batch.shelfId : expectedShelfId
 
-    // 余量校验以数据库中的最新占用数为准（并兜底取 store 中的较大值），避免快速连续上架时读到缓存值
-    const [liveRow, hosted] = await Promise.all([
-      db.shelves.get(shelfId),
-      db.batches.where('shelfId').equals(shelfId).count()
-    ])
-    const live = liveRow ?? shelf
-    const occupiedNow = Math.max(live.occupied, hosted, occupancyMap.value[shelfId]?.occupied ?? 0)
-    if (occupiedNow >= live.capacity) {
+    const hold = acquireHold(targetShelfId, batchId)
+    if (!hold) {
+      const occupancy = occupancyMap.value[targetShelfId]
       return {
         ok: false,
-        message: `${shelf.room} ${shelf.rackNo} 第 ${shelf.layerNo} 层已满（${occupiedNow}/${live.capacity}），请先腾挪或改选窖位`
+        message: occupancy
+          ? `${shelfLabel(targetShelfId)} 已无余量或已被本页另一个上架操作占位（${occupancy.occupied}/${occupancy.capacity}），请改选窖位`
+          : '目标窖位不存在，请刷新后重试',
+        code: 'CAPACITY_TAKEN',
+        occupied: occupancy?.occupied,
+        capacity: occupancy?.capacity,
+        movedTo: batch.shelfId
       }
     }
 
-    const previousShelfId = batch.shelfId
-    const now = Date.now()
-    await db.transaction('rw', [db.shelves, db.batches], async () => {
-      if (previousShelfId) {
-        const previous = await db.shelves.get(previousShelfId)
-        if (previous) {
-          // 占用数按「移走后仍挂接在该窖位的批次数」重算，避免历史脏数据累积偏差
-          const remaining = await db.batches
-            .where('shelfId')
-            .equals(previousShelfId)
-            .and((item) => item.id !== batchId)
-            .count()
-          await db.shelves.update(previous.id, {
-            occupied: Math.max(0, Math.min(previous.capacity, remaining)),
-            updatedAt: now
-          })
-        }
-      }
-      await db.shelves.update(shelfId, {
-        occupied: Math.min(live.capacity, occupiedNow + 1),
-        updatedAt: now
-      })
-      await db.batches.update(batchId, {
-        shelfId,
-        state: batch.state === '凝乳' ? '熟成中' : batch.state,
-        updatedAt: now
-      })
+    const result = await runShelfMutation({
+      batchId,
+      targetShelfId,
+      expectedShelfId: fromShelfId
     })
 
-    return {
-      ok: true,
-      message: `已上架至 ${shelf.room} ${shelf.rackNo} 第 ${shelf.layerNo} 层（${Math.min(
-        live.capacity,
-        occupiedNow + 1
-      )}/${live.capacity}）`
-    }
+    // 无论成功失败都释放本页占位：成功后真实挂接数已经 +1，占位继续挂着会重复扣减
+    releaseHold(targetShelfId)
+    return result
   }
 
-  /** 下架：释放窖位占用并清空批次 shelfId */
-  async function releaseBatch(batchId: string): Promise<ShelfAssignResult> {
+  /** 换架语义别名，语义上 expectedShelfId 必传（打开换架弹窗时的原窖位） */
+  async function reassignBatch(
+    batchId: string,
+    targetShelfId: string,
+    expectedShelfId: string
+  ): Promise<ShelfAssignResult> {
+    return assignBatch(batchId, targetShelfId, expectedShelfId)
+  }
+
+  /** 下架：事务内重新核对批次当前位置，确认仍挂在提交者看到的窖位才释放 */
+  async function releaseBatch(
+    batchId: string,
+    expectedShelfId?: string | null
+  ): Promise<ShelfAssignResult> {
     const batch = milkStore.batches.find((item) => item.id === batchId)
-    if (!batch) return { ok: false, message: '批次不存在，请刷新后重试' }
-    if (!batch.shelfId) return { ok: false, message: '该批次尚未上架' }
-    const shelfId = batch.shelfId
-    const now = Date.now()
-    await db.transaction('rw', [db.shelves, db.batches], async () => {
-      const shelf = await db.shelves.get(shelfId)
-      if (shelf) {
-        const hosted = await db.batches.where('shelfId').equals(shelfId).count()
-        const occupied = Math.max(0, Math.max(shelf.occupied, hosted) - 1)
-        await db.shelves.update(shelfId, { occupied, updatedAt: now })
-      }
-      await db.batches.update(batchId, { shelfId: null, updatedAt: now })
-    })
-    return { ok: true, message: `已下架，${shelfLabel(shelfId)} 释放 1 块余量` }
+    if (!batch) return { ok: false, message: '批次不存在，请刷新后重试', code: 'BATCH_NOT_FOUND' }
+    if (!batch.shelfId) return { ok: false, message: '该批次尚未上架', code: 'NOT_ASSIGNED' }
+    const fromShelfId = expectedShelfId === undefined ? batch.shelfId : expectedShelfId
+    return runShelfMutation({ batchId, targetShelfId: null, expectedShelfId: fromShelfId })
   }
 
   /** 按温区阈值给出窖位可用性说明，用于卡片提示 */
@@ -279,7 +350,10 @@ export const useShelfStore = defineStore('shelf', () => {
     totalOccupied,
     occupancyPercent,
     fullShelfCount,
+    conflictShelfCount,
+    conflictShelves,
     unassignedBatches,
+    assignedBatches,
     occupancyOf,
     shelfLabel,
     batchesOfShelf,
@@ -287,10 +361,15 @@ export const useShelfStore = defineStore('shelf', () => {
     setCurrentShelf,
     patchFilter,
     resetFilter,
+    acquireHold,
+    releaseHold,
+    releaseAllHolds,
+    isHeld,
     createShelf,
     updateShelf,
     removeShelf,
     assignBatch,
+    reassignBatch,
     releaseBatch,
     zoneOptions
   }

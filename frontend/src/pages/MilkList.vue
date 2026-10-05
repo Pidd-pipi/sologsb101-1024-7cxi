@@ -2,7 +2,7 @@
 import { computed, reactive, ref } from 'vue'
 import { storeToRefs } from 'pinia'
 import { ElMessage, ElMessageBox, type FormInstance, type FormRules } from 'element-plus'
-import { Delete, Edit, Plus, Right } from '@element-plus/icons-vue'
+import { Bottom, Delete, Edit, Plus, Right, Switch } from '@element-plus/icons-vue'
 import EmptyPanel from '@/components/common/EmptyPanel.vue'
 import FilterBar, {
   type FilterModel,
@@ -314,6 +314,121 @@ function remainText(row: BatchRow): string {
   if (row.remainDays < 0) return `超期 ${Math.abs(row.remainDays)} 天`
   return `剩余 ${row.remainDays} 天`
 }
+
+// ── 批次台账内的换架 / 下架：与货架看板共用同一套窖位事务 ──────────────
+const moveDialogVisible = ref(false)
+const moveFormRef = ref<FormInstance>()
+const moveSubmitting = ref(false)
+const moveBatchId = ref<string | null>(null)
+const moveTargetShelfId = ref('')
+/** 打开换架弹窗时批次所在窖位，提交时在事务内重新核对 */
+const moveExpectedShelfId = ref<string | null>(null)
+const moveConflict = ref<{ code: string; message: string } | null>(null)
+
+const moveRules: FormRules = {
+  shelfId: [{ required: true, message: '请选择目标窖位', trigger: 'change' }]
+}
+
+const moveBatch = computed<Batch | null>(
+  () => milkStore.batches.find((batch) => batch.id === moveBatchId.value) ?? null
+)
+
+/** 可换入的窖位：排除批次当前窖位，仅展示有余量的窖位 */
+const moveShelfOptions = computed(() =>
+  shelfStore.shelves
+    .filter((shelf) => shelf.id !== moveBatch.value?.shelfId)
+    .map((shelf) => ({
+      id: shelf.id,
+      label: `${shelfStore.shelfLabel(shelf.id)}（${shelf.tempZone} 余 ${
+        shelfStore.occupancyMap[shelf.id]?.free ?? 0
+      } 块）`,
+      free: shelfStore.occupancyMap[shelf.id]?.free ?? 0,
+      held: shelfStore.occupancyMap[shelf.id]?.held ?? 0
+    }))
+)
+
+function openMoveDialog(batch: Batch): void {
+  moveBatchId.value = batch.id
+  moveExpectedShelfId.value = batch.shelfId
+  moveConflict.value = null
+  moveTargetShelfId.value =
+    shelfStore.shelves.find(
+      (shelf) => shelf.id !== batch.shelfId && (shelfStore.occupancyMap[shelf.id]?.free ?? 0) > 0
+    )?.id ?? ''
+  moveDialogVisible.value = true
+}
+
+function onMoveTargetChange(): void {
+  moveConflict.value = null
+}
+
+function onMoveDialogClose(): void {
+  shelfStore.releaseAllHolds()
+  moveConflict.value = null
+  moveSubmitting.value = false
+}
+
+async function submitMove(): Promise<void> {
+  if (!moveFormRef.value || !moveBatchId.value) return
+  const valid = await moveFormRef.value.validate().catch(() => false)
+  if (!valid) return
+  if (moveSubmitting.value) return
+  moveSubmitting.value = true
+  moveConflict.value = null
+  try {
+    const result = await shelfStore.assignBatch(
+      moveBatchId.value,
+      moveTargetShelfId.value,
+      moveExpectedShelfId.value ?? moveBatch.value?.shelfId ?? null
+    )
+    if (result.ok) {
+      ElMessage.success(result.message)
+      moveDialogVisible.value = false
+    } else {
+      moveConflict.value = { code: result.code ?? 'CAPACITY_TAKEN', message: result.message }
+      ElMessage.warning(result.message)
+      if (result.code === 'BATCH_MOVED' && result.movedTo !== undefined) {
+        moveExpectedShelfId.value = result.movedTo
+        if (moveTargetShelfId.value === result.movedTo) {
+          moveTargetShelfId.value =
+            shelfStore.shelves.find(
+              (shelf) =>
+                shelf.id !== result.movedTo && (shelfStore.occupancyMap[shelf.id]?.free ?? 0) > 0
+            )?.id ?? ''
+        }
+      }
+    }
+  } finally {
+    moveSubmitting.value = false
+  }
+}
+
+async function releaseBatchFromLedger(batch: Batch): Promise<void> {
+  try {
+    await ElMessageBox.confirm(
+      `将批次「${milkStore.milkNameOf(batch.milkId)} · ${batch.cheeseType} ${batch.curdedAt}」下架？下架后 ${shelfStore.shelfLabel(
+        batch.shelfId
+      )} 释放 1 块余量。`,
+      '下架确认',
+      { type: 'warning', confirmButtonText: '确认下架', cancelButtonText: '取消' }
+    )
+  } catch {
+    return
+  }
+  const result = await shelfStore.releaseBatch(batch.id, batch.shelfId)
+  if (result.ok) ElMessage.success(result.message)
+  else ElMessage.warning(result.message)
+}
+
+/** 窖位冲突徽标：超占红色 / 计数漂移橙色 */
+function shelfConflictOf(batch: Batch): 'over' | 'drift' | null {
+  if (!batch.shelfId) return null
+  const occupancy = shelfStore.occupancyMap[batch.shelfId]
+  if (!occupancy) return null
+  if (occupancy.overCapacity) return 'over'
+  if (occupancy.drift) return 'drift'
+  return null
+}
 </script>
 
 <template>
@@ -468,11 +583,34 @@ function remainText(row: BatchRow): string {
             <span class="mono">{{ row.batch.weightKg }} kg</span>
           </template>
         </el-table-column>
-        <el-table-column label="窖位" min-width="170">
+        <el-table-column label="窖位 / 真实余量" min-width="210">
           <template #default="{ row }">
-            <el-tag v-if="row.batch.shelfId" type="success" effect="plain">
-              {{ shelfStore.shelfLabel(row.batch.shelfId) }}
-            </el-tag>
+            <div v-if="row.batch.shelfId" class="shelf-cell">
+              <el-tag type="success" effect="plain">
+                {{ shelfStore.shelfLabel(row.batch.shelfId) }}
+              </el-tag>
+              <el-tag
+                v-if="shelfConflictOf(row.batch) === 'over'"
+                type="danger"
+                size="small"
+                effect="dark"
+              >
+                超占 {{ shelfStore.occupancyMap[row.batch.shelfId]?.occupied }}/{{
+                  shelfStore.occupancyMap[row.batch.shelfId]?.capacity
+                }}
+              </el-tag>
+              <el-tag
+                v-else-if="shelfConflictOf(row.batch) === 'drift'"
+                type="warning"
+                size="small"
+                effect="dark"
+              >
+                计数冲突 余 {{ shelfStore.occupancyMap[row.batch.shelfId]?.free }}
+              </el-tag>
+              <span v-else class="muted shelf-cell__free">
+                余 {{ shelfStore.occupancyMap[row.batch.shelfId]?.free ?? 0 }} 块
+              </span>
+            </div>
             <el-tag v-else type="info" effect="plain">未上架</el-tag>
           </template>
         </el-table-column>
@@ -527,8 +665,26 @@ function remainText(row: BatchRow): string {
             <span v-else class="muted">已终态</span>
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="160" fixed="right">
+        <el-table-column label="操作" width="250" fixed="right">
           <template #default="{ row }">
+            <el-button
+              v-if="row.batch.shelfId && row.batch.state !== '已出库' && row.batch.state !== '报废'"
+              text
+              type="warning"
+              :icon="Switch"
+              @click="openMoveDialog(row.batch)"
+            >
+              换架
+            </el-button>
+            <el-button
+              v-if="row.batch.shelfId"
+              text
+              type="info"
+              :icon="Bottom"
+              @click="releaseBatchFromLedger(row.batch)"
+            >
+              下架
+            </el-button>
             <el-button text :icon="Edit" @click="openBatchDialog(row.batch)">编辑</el-button>
             <el-button text type="danger" :icon="Delete" @click="removeBatch(row.batch)">
               删除
@@ -646,6 +802,60 @@ function remainText(row: BatchRow): string {
         <el-button type="primary" @click="submitBatch">保存</el-button>
       </template>
     </el-dialog>
+
+    <el-dialog
+      v-model="moveDialogVisible"
+      title="批次换架"
+      width="560px"
+      destroy-on-close
+      @close="onMoveDialogClose"
+    >
+      <el-form ref="moveFormRef" :model="{ shelfId: moveTargetShelfId }" :rules="moveRules" label-width="110px">
+        <el-form-item label="批次">
+          <span class="mono">
+            {{ moveBatch ? `${milkStore.milkNameOf(moveBatch.milkId)} · ${moveBatch.cheeseType} ${moveBatch.curdedAt}` : '—' }}
+          </span>
+        </el-form-item>
+        <el-form-item label="当前窖位">
+          <el-tag type="success" effect="plain">{{ shelfStore.shelfLabel(moveBatch?.shelfId ?? null) }}</el-tag>
+        </el-form-item>
+        <el-form-item label="目标窖位" prop="shelfId">
+          <el-select
+            v-model="moveTargetShelfId"
+            placeholder="选择换入窖位（显示实时真实余量）"
+            style="width: 100%"
+            @update:model-value="onMoveTargetChange"
+          >
+            <el-option
+              v-for="option in moveShelfOptions"
+              :key="option.id"
+              :label="option.label + (option.held > 0 ? '（本页已占位）' : '')"
+              :value="option.id"
+              :disabled="option.free <= 0"
+            />
+          </el-select>
+        </el-form-item>
+      </el-form>
+      <el-alert
+        v-if="moveConflict"
+        :key="moveConflict.code + moveConflict.message"
+        type="error"
+        :closable="false"
+        show-icon
+        class="alert-gap"
+        title="提交冲突，原选择已保留"
+      >
+        {{ moveConflict.message }}
+        <span v-if="moveConflict.code === 'BATCH_MOVED'">可直接再次点击确认，按批次当前位置重新提交。</span>
+      </el-alert>
+      <el-alert v-else type="info" :closable="false" show-icon>
+        提交时会在同一事务内重新核对目标窖位真实余量与批次当前位置；容量被抢走时本次换架整体回滚，占位立即释放。
+      </el-alert>
+      <template #footer>
+        <el-button @click="moveDialogVisible = false">取消</el-button>
+        <el-button type="primary" :loading="moveSubmitting" @click="submitMove">确认换架</el-button>
+      </template>
+    </el-dialog>
   </section>
 </template>
 
@@ -653,5 +863,20 @@ function remainText(row: BatchRow): string {
 .warn {
   color: #c0392b;
   font-weight: 600;
+}
+
+.shelf-cell {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.shelf-cell__free {
+  font-size: 12px;
+}
+
+.alert-gap {
+  margin-bottom: 12px;
 }
 </style>

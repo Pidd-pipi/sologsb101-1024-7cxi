@@ -2,7 +2,7 @@
 import { computed, reactive, ref } from 'vue'
 import { storeToRefs } from 'pinia'
 import { ElMessage, ElMessageBox, type FormInstance, type FormRules } from 'element-plus'
-import { Delete, Edit, Plus, Position } from '@element-plus/icons-vue'
+import { Delete, Edit, Plus, Position, Switch } from '@element-plus/icons-vue'
 import EmptyPanel from '@/components/common/EmptyPanel.vue'
 import FilterBar, {
   type FilterModel,
@@ -11,7 +11,14 @@ import FilterBar, {
 import StatBadge from '@/components/common/StatBadge.vue'
 import { useMilkStore } from '@/stores/milkStore'
 import { useShelfStore } from '@/stores/shelfStore'
-import { TEMP_ZONES, createEmptyShelfFilter, type Shelf, type TempZone } from '@/types/shelf'
+import {
+  TEMP_ZONES,
+  createEmptyShelfFilter,
+  type Shelf,
+  type ShelfConflictCode,
+  type TempZone
+} from '@/types/shelf'
+import type { Batch } from '@/types/batch'
 import { TEMP_RANGE, ZONE_COLOR } from '@/utils/temperature'
 
 const shelfStore = useShelfStore()
@@ -27,7 +34,10 @@ const {
   totalOccupied,
   occupancyPercent,
   fullShelfCount,
+  conflictShelfCount,
+  conflictShelves,
   unassignedBatches,
+  assignedBatches,
   roomOptions,
   filteredShelves,
   roomShelves
@@ -38,6 +48,14 @@ const assignFormRef = ref<FormInstance>()
 const shelfDialogVisible = ref(false)
 const assignDialogVisible = ref(false)
 const editingShelfId = ref<string | null>(null)
+
+/** 上架弹窗模式：assign=未上架批次上架；move=已上架批次换架 */
+const assignMode = ref<'assign' | 'move'>('assign')
+/** 打开换架弹窗时批次所在窖位（提交时重新核对批次当前位置的期望值） */
+const expectedShelfId = ref<string | null>(null)
+const assignSubmitting = ref(false)
+/** 最近一次提交冲突（弹窗内常驻告警，保留用户原选择） */
+const assignConflict = ref<{ code: ShelfConflictCode; message: string } | null>(null)
 
 const shelfForm = reactive({
   room: '',
@@ -187,10 +205,65 @@ async function removeShelf(shelf: Shelf): Promise<void> {
   ElMessage.success('窖位已删除，关联批次已置为未上架')
 }
 
+/** 弹窗内可选择的批次：上架模式只列未上架，换架模式只列已上架 */
+const assignableBatches = computed<Batch[]>(() =>
+  assignMode.value === 'move' ? assignedBatches.value : unassignedBatches.value
+)
+
+/** 换架模式下当前选中批次（冲突时显示「批次已被换走」、排除其当前窖位用） */
+const selectedBatch = computed<Batch | null>(
+  () => milkStore.batches.find((batch) => batch.id === assignForm.batchId) ?? null
+)
+
+/** 弹窗内可选择的目标窖位：换架时排除选中批次当前所在窖位 */
+const targetShelves = computed<Shelf[]>(() => {
+  if (assignMode.value !== 'move') return shelves.value
+  return shelves.value.filter((shelf) => shelf.id !== selectedBatch.value?.shelfId)
+})
+
 function openAssignDialog(shelfId?: string): void {
+  assignMode.value = 'assign'
+  assignConflict.value = null
+  expectedShelfId.value = null
   assignForm.batchId = unassignedBatches.value[0]?.id ?? ''
-  assignForm.shelfId = shelfId ?? filteredShelves.value.find((shelf) => (occupancyMap.value[shelf.id]?.free ?? 0) > 0)?.id ?? ''
+  assignForm.shelfId =
+    shelfId ?? filteredShelves.value.find((shelf) => (occupancyMap.value[shelf.id]?.free ?? 0) > 0)?.id ?? ''
   assignDialogVisible.value = true
+}
+
+/** 换架弹窗：默认带入该批次与其当前窖位，目标窖位预选另一个有余量的窖位 */
+function openMoveDialog(batch?: Batch, targetShelfId?: string): void {
+  assignMode.value = 'move'
+  assignConflict.value = null
+  const current = batch ?? assignedBatches.value[0] ?? null
+  assignForm.batchId = current?.id ?? ''
+  expectedShelfId.value = current?.shelfId ?? null
+  assignForm.shelfId =
+    targetShelfId ??
+    filteredShelves.value.find(
+      (shelf) => shelf.id !== current?.shelfId && (occupancyMap.value[shelf.id]?.free ?? 0) > 0
+    )?.id ??
+    ''
+  assignDialogVisible.value = true
+}
+
+/** 切换批次（换架模式下批次变了，期望原窖位也要跟着变） */
+function onAssignBatchChange(batchId: string): void {
+  assignConflict.value = null
+  const batch = milkStore.batches.find((item) => item.id === batchId)
+  if (assignMode.value === 'move') expectedShelfId.value = batch?.shelfId ?? null
+}
+
+function onAssignShelfChange(): void {
+  // 用户改选窖位后清掉旧冲突，允许按保留下来的原选择重新提交
+  assignConflict.value = null
+}
+
+/** 弹窗关闭：释放本页预占位（提交成功后真实数据已落库；失败/取消则必须释放占位） */
+function onAssignDialogClose(): void {
+  shelfStore.releaseAllHolds()
+  assignConflict.value = null
+  assignSubmitting.value = false
 }
 
 const assignPreview = computed(() => {
@@ -199,11 +272,15 @@ const assignPreview = computed(() => {
   return {
     ...occupancy,
     label: shelfStore.shelfLabel(assignForm.shelfId),
-    after: Math.min(occupancy.capacity, occupancy.occupied + 1),
+    after: Math.min(occupancy.capacity, occupancy.occupied + occupancy.held + 1),
     afterPercent:
       occupancy.capacity === 0
         ? 100
-        : Math.round((Math.min(occupancy.capacity, occupancy.occupied + 1) / occupancy.capacity) * 100)
+        : Math.round(
+            (Math.min(occupancy.capacity, occupancy.occupied + occupancy.held + 1) /
+              occupancy.capacity) *
+              100
+          )
   }
 })
 
@@ -211,23 +288,51 @@ async function submitAssign(): Promise<void> {
   if (!assignFormRef.value) return
   const valid = await assignFormRef.value.validate().catch(() => false)
   if (!valid) return
-  const result = await shelfStore.assignBatch(assignForm.batchId, assignForm.shelfId)
-  if (result.ok) {
-    ElMessage.success(result.message)
-    assignDialogVisible.value = false
-  } else {
-    ElMessage.warning(result.message)
+  if (assignSubmitting.value) return
+  assignSubmitting.value = true
+  assignConflict.value = null
+  try {
+    const result =
+      assignMode.value === 'move'
+        ? await shelfStore.assignBatch(
+            assignForm.batchId,
+            assignForm.shelfId,
+            expectedShelfId.value ?? selectedBatch.value?.shelfId ?? null
+          )
+        : await shelfStore.assignBatch(assignForm.batchId, assignForm.shelfId, null)
+    if (result.ok) {
+      ElMessage.success(result.message)
+      assignDialogVisible.value = false
+    } else {
+      // 容量被抢走 / 批次已被换走：保留批次与目标窖位选择，弹窗内常驻显示冲突
+      assignConflict.value = { code: result.code ?? 'CAPACITY_TAKEN', message: result.message }
+      ElMessage.warning(result.message)
+      // 提交时批次实际已被换到别处：更新期望值，用户可直接重试（按当前位置再次换架）
+      if (result.code === 'BATCH_MOVED' && result.movedTo !== undefined) {
+        expectedShelfId.value = result.movedTo
+        // 若保留下来的目标窖位恰好是批次新所在窖位，自动改选一个有余量的窖位
+        if (assignForm.shelfId === result.movedTo) {
+          assignForm.shelfId =
+            targetShelves.value.find((shelf) => (occupancyMap.value[shelf.id]?.free ?? 0) > 0)?.id ??
+            ''
+        }
+      }
+    }
+  } finally {
+    assignSubmitting.value = false
   }
 }
 
 async function release(batchId: string): Promise<void> {
-  const result = await shelfStore.releaseBatch(batchId)
+  // 下架也把当前窖位作为期望值传入，事务提交前重新核对批次位置
+  const batch = milkStore.batches.find((item) => item.id === batchId)
+  const result = await shelfStore.releaseBatch(batchId, batch?.shelfId ?? null)
   if (result.ok) ElMessage.success(result.message)
   else ElMessage.warning(result.message)
 }
 
 async function assignBatchTo(shelfId: string, batchId: string): Promise<void> {
-  const result = await shelfStore.assignBatch(batchId, shelfId)
+  const result = await shelfStore.assignBatch(batchId, shelfId, null)
   if (result.ok) ElMessage.success(result.message)
   else ElMessage.warning(result.message)
 }
@@ -255,8 +360,30 @@ function batchOptionLabel(batchId: string): string {
         <el-button :icon="Position" :disabled="unassignedBatches.length === 0" @click="openAssignDialog()">
           上架分配
         </el-button>
+        <el-button type="warning" :icon="Switch" :disabled="assignedBatches.length === 0" @click="openMoveDialog()">
+          换架
+        </el-button>
       </div>
     </div>
+
+    <el-alert
+      v-if="conflictShelfCount > 0"
+      type="error"
+      show-icon
+      :closable="false"
+      class="alert-gap"
+      title="检测到窖位容量冲突，请以真实余量为准处理"
+    >
+      <template #default>
+        <span v-for="shelf in conflictShelves" :key="shelf.id" class="conflict-chip">
+          {{ shelf.room }} {{ shelf.rackNo }} 第 {{ shelf.layerNo }} 层：
+          <strong>{{ occupancyMap[shelf.id]?.occupied ?? 0 }} / {{ shelf.capacity }} 块</strong>
+          <template v-if="occupancyMap[shelf.id]?.drift">
+            （台账计数 {{ shelf.occupied }}，已按真实挂接数校正显示）
+          </template>
+        </span>
+      </template>
+    </el-alert>
 
     <div class="stat-row">
       <StatBadge label="窖位总数" :value="shelves.length" suffix="个" icon="Grid" />
@@ -331,21 +458,46 @@ function batchOptionLabel(batchId: string): string {
           </header>
 
           <div class="shelf-card__meta">
-            <span class="mono">
-              {{ occupancyMap[shelf.id]?.occupied ?? shelf.occupied }} / {{ shelf.capacity }} 块
+            <span class="mono" :class="{ 'conflict-text': occupancyMap[shelf.id]?.conflict }">
+              {{ occupancyMap[shelf.id]?.occupied ?? 0 }} / {{ shelf.capacity }} 块
+              <el-tag
+                v-if="occupancyMap[shelf.id]?.overCapacity"
+                type="danger"
+                size="small"
+                effect="dark"
+                class="conflict-tag"
+              >
+                超占
+              </el-tag>
+              <el-tag
+                v-else-if="occupancyMap[shelf.id]?.drift"
+                type="warning"
+                size="small"
+                effect="dark"
+                class="conflict-tag"
+              >
+                计数冲突
+              </el-tag>
             </span>
-            <span class="muted">余量 {{ occupancyMap[shelf.id]?.free ?? shelf.capacity }} 块</span>
+            <span class="muted">
+              余量 {{ occupancyMap[shelf.id]?.free ?? shelf.capacity }} 块
+              <el-tag v-if="occupancyMap[shelf.id]?.held > 0" type="warning" size="small" effect="plain">
+                本页已占 1 块
+              </el-tag>
+            </span>
           </div>
 
           <el-progress
             :percentage="occupancyMap[shelf.id]?.percent ?? 0"
             :stroke-width="12"
             :color="
-              occupancyMap[shelf.id]?.full
+              occupancyMap[shelf.id]?.overCapacity
                 ? '#c0392b'
-                : occupancyMap[shelf.id]?.tight
-                  ? '#d68910'
-                  : '#1e8449'
+                : occupancyMap[shelf.id]?.full
+                  ? '#c0392b'
+                  : occupancyMap[shelf.id]?.tight
+                    ? '#d68910'
+                    : '#1e8449'
             "
           />
 
@@ -376,6 +528,15 @@ function batchOptionLabel(batchId: string): string {
               @click="openAssignDialog(shelf.id)"
             >
               上架
+            </el-button>
+            <el-button
+              text
+              type="warning"
+              :icon="Switch"
+              :disabled="(occupancyMap[shelf.id]?.free ?? 0) <= 0 || assignedBatches.length === 0"
+              @click="openMoveDialog(undefined, shelf.id)"
+            >
+              换架到此
             </el-button>
             <el-button text :icon="Edit" @click="openShelfDialog(shelf)">编辑</el-button>
             <el-button text type="danger" :icon="Delete" @click="removeShelf(shelf)">删除</el-button>
@@ -473,40 +634,83 @@ function batchOptionLabel(batchId: string): string {
       </template>
     </el-dialog>
 
-    <el-dialog v-model="assignDialogVisible" title="批次上架分配" width="580px" destroy-on-close>
+    <el-dialog
+      v-model="assignDialogVisible"
+      :title="assignMode === 'move' ? '批次换架' : '批次上架分配'"
+      width="580px"
+      destroy-on-close
+      @close="onAssignDialogClose"
+    >
       <el-form ref="assignFormRef" :model="assignForm" :rules="assignRules" label-width="110px">
-        <el-form-item label="批次" prop="batchId">
-          <el-select v-model="assignForm.batchId" placeholder="选择待上架批次" style="width: 100%">
+        <el-form-item :label="assignMode === 'move' ? '换架批次' : '批次'" prop="batchId">
+          <el-select
+            v-model="assignForm.batchId"
+            :placeholder="assignMode === 'move' ? '选择要换架的批次' : '选择待上架批次'"
+            style="width: 100%"
+            @update:model-value="onAssignBatchChange"
+          >
             <el-option
-              v-for="batch in unassignedBatches"
+              v-for="batch in assignableBatches"
               :key="batch.id"
-              :label="batchOptionLabel(batch.id)"
+              :label="
+                assignMode === 'move'
+                  ? `${batchOptionLabel(batch.id)}（现：${shelfStore.shelfLabel(batch.shelfId)}）`
+                  : batchOptionLabel(batch.id)
+              "
               :value="batch.id"
             />
           </el-select>
         </el-form-item>
         <el-form-item label="目标窖位" prop="shelfId">
-          <el-select v-model="assignForm.shelfId" placeholder="选择窖位" style="width: 100%">
+          <el-select
+            v-model="assignForm.shelfId"
+            placeholder="选择窖位"
+            style="width: 100%"
+            @update:model-value="onAssignShelfChange"
+          >
             <el-option
-              v-for="shelf in shelves"
+              v-for="shelf in targetShelves"
               :key="shelf.id"
-              :label="`${shelfStore.shelfLabel(shelf.id)}（${shelf.tempZone} 余 ${occupancyMap[shelf.id]?.free ?? 0} 块）`"
+              :label="
+                `${shelfStore.shelfLabel(shelf.id)}（${shelf.tempZone} 余 ${occupancyMap[shelf.id]?.free ?? 0} 块）` +
+                (occupancyMap[shelf.id]?.held > 0 ? '（本页已占位）' : '')
+              "
               :value="shelf.id"
-              :disabled="(occupancyMap[shelf.id]?.free ?? 0) <= 0"
+              :disabled="(occupancyMap[shelf.id]?.free ?? 0) <= 0 || shelfStore.isHeld(shelf.id)"
             />
           </el-select>
         </el-form-item>
       </el-form>
-      <el-alert v-if="assignPreview" :type="assignPreview.full ? 'error' : 'success'" :closable="false" show-icon>
+      <el-alert
+        v-if="assignConflict"
+        :key="assignConflict.code + assignConflict.message"
+        type="error"
+        :closable="false"
+        show-icon
+        class="alert-gap"
+        title="提交冲突，原选择已保留"
+      >
+        {{ assignConflict.message }}
+        <span v-if="assignConflict.code === 'BATCH_MOVED'">可直接再次点击确认，按批次当前位置重新提交。</span>
+      </el-alert>
+      <el-alert
+        v-else-if="assignPreview"
+        :type="assignPreview.conflict || assignPreview.full ? 'error' : 'success'"
+        :closable="false"
+        show-icon
+      >
         {{ assignPreview.label }}：当前 {{ assignPreview.occupied }} / {{ assignPreview.capacity }} 块，
-        上架后 {{ assignPreview.after }} / {{ assignPreview.capacity }} 块（占用率 {{ assignPreview.afterPercent }}%）
+        {{ assignMode === 'move' ? '换架后' : '上架后' }} {{ assignPreview.after }} /
+        {{ assignPreview.capacity }} 块（占用率 {{ assignPreview.afterPercent }}%）
       </el-alert>
       <el-alert v-else type="warning" :closable="false" show-icon>
-        请选择目标窖位，系统会实时校验余量。
+        请选择目标窖位，提交时会在事务内重新核对真实余量与批次当前位置。
       </el-alert>
       <template #footer>
         <el-button @click="assignDialogVisible = false">取消</el-button>
-        <el-button type="primary" @click="submitAssign">确认上架</el-button>
+        <el-button type="primary" :loading="assignSubmitting" @click="submitAssign">
+          {{ assignMode === 'move' ? '确认换架' : '确认上架' }}
+        </el-button>
       </template>
     </el-dialog>
   </section>
@@ -584,5 +788,24 @@ function batchOptionLabel(batchId: string): string {
 
 .room-select {
   width: 170px;
+}
+
+.alert-gap {
+  margin-bottom: 16px;
+}
+
+.conflict-chip {
+  display: inline-block;
+  margin-right: 16px;
+  font-size: 13px;
+}
+
+.conflict-text {
+  color: #c0392b;
+  font-weight: 600;
+}
+
+.conflict-tag {
+  margin-left: 6px;
 }
 </style>

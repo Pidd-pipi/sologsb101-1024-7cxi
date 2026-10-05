@@ -1,6 +1,7 @@
 import { defineStore } from 'pinia'
 import { computed, ref, type ComputedRef } from 'vue'
 import { db } from '@/utils/db'
+import { releaseShelfInTransaction } from '@/utils/shelfTransaction'
 import { useIdbTable } from '@/hooks/useIdbTable'
 import {
   createEmptyMilkFilter,
@@ -237,6 +238,7 @@ export const useMilkStore = defineStore('milk', () => {
   async function removeBatch(id: string): Promise<boolean> {
     const batch = batches.value.find((item) => item.id === id)
     if (!batch) return false
+    const shelfIdToRelease = batch.shelfId
     await db.transaction(
       'rw',
       [db.batches, db.shelves, db.turnings, db.environments, db.tastings],
@@ -245,15 +247,9 @@ export const useMilkStore = defineStore('milk', () => {
         await db.environments.where('batchId').equals(id).delete()
         await db.tastings.where('batchId').equals(id).delete()
         await db.batches.delete(id)
-        // 已占用窖位释放一块
-        if (batch.shelfId) {
-          const shelf = await db.shelves.get(batch.shelfId)
-          if (shelf) {
-            await db.shelves.update(shelf.id, {
-              occupied: Math.max(0, shelf.occupied - 1),
-              updatedAt: Date.now()
-            })
-          }
+        // 已占用窖位释放一块：先删批次再按真实挂接数重算 occupied，避免自减漂移
+        if (shelfIdToRelease) {
+          await releaseShelfInTransaction(shelfIdToRelease, Date.now())
         }
       }
     )

@@ -83,7 +83,7 @@ sologsb101-1024/
     ├── public/favicon.svg
     └── src/
         ├── types/                # milk.ts batch.ts shelf.ts turning.ts environment.ts tasting.ts
-        ├── stores/               # milkStore.ts shelfStore.ts turningStore.ts tastingStore.ts
+        ├── stores/               # milkStore.ts（奶源/批次台账） shelfStore.ts（窖位事务：上架/换架/下架同一套核对+占位） turningStore.ts tastingStore.ts
         ├── components/common/    # GradeTag.vue FilterBar.vue StatBadge.vue EmptyPanel.vue
         ├── hooks/                # useAgingDays.ts useIdbTable.ts
         ├── pages/                # MilkList.vue ShelfBoard.vue TurningPlan.vue EnvironmentView.vue TastingBoard.vue
@@ -108,10 +108,11 @@ sologsb101-1024/
 ## 五、IndexedDB 与数据存储说明
 
 - **数据库名**：`gbcheeseage`（Dexie 实例定义在 `frontend/src/utils/db.ts`）。
-- **结构版本**：`DB_VERSION = 2`。
+- **结构版本**：`DB_VERSION = 3`。
   - `version(1)`：初版六张业务表与索引。
   - `version(2).stores(...).upgrade(async (tx) => {...})`：**真实迁移**——为 `batches` 补齐 `shelfId` / `conclusion` / 时间戳；按作业日期为历史 `turnings` 回填 `seq` 执行序号；把湿度越界的 `environments` 记录重算为异常并补默认措施；把 `shelves` 的负数容量与占用数归零。
-- **六张表**：
+  - `version(3)`：新增 `ops` 窖位占位 / 冲突记录表。上架、换架、下架统一走同一套事务，提交时在事务内重新核对容量与批次当前位置；容量被抢则置 `conflict` 释放占位，后提交者保留原选择并展示冲突。
+- **七张表**：
 
 | 表 | 模型 | 关键字段 | 索引 |
 | --- | --- | --- | --- |
@@ -121,6 +122,7 @@ sologsb101-1024/
 | `turnings` | Turning 转架作业 | `batchId` `shelfId` `doneAt` `type`(转架/翻面/擦洗) `brinePct` `operator` `state` `seq` | id, batchId, shelfId, doneAt, type, state, seq |
 | `environments` | Environment 环境记录 | `batchId` `recordedAt` `tempC` `humidityPct` `anomaly` `action` | id, batchId, recordedAt, anomaly |
 | `tastings` | Tasting 品评 | `batchId` `outAt` `appearance/flavor/texture` 描述 + 三维评分 `score` `conclusion` `taster` | id, batchId, outAt, score, conclusion |
+| `ops` | ShelfOp 占位 / 冲突 | `batchId` `op`(上架/换架/下架) `shelfId` `fromShelfId` `status`(held/done/conflict/cancelled) `expiresAt` | id, batchId, shelfId, op, status, createdAt, expiresAt |
 
 - **首屏自动播种**：`initDatabase()` 在 `db.open()` 后执行 `if ((await db.milks.count()) === 0) { await seedDatabase() }`，播种 3 层互相引用的演示数据（奶源 3 → 生产批次 4 → 转架 4 / 环境 4 / 品评 3），使用固定 id + `bulkPut`，**幂等**（重复调用不会产生重复记录）。
 - **localStorage**：仅存元数据 —— `gbcheeseage:db-version`（本地结构版本）、`gbcheeseage:last-backup-at`（最近一次导出时间）、`gbcheeseage:ui-prefs`（当前库房、作业排序方式、曲线指标）。

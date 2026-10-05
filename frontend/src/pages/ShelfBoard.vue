@@ -11,7 +11,14 @@ import FilterBar, {
 import StatBadge from '@/components/common/StatBadge.vue'
 import { useMilkStore } from '@/stores/milkStore'
 import { useShelfStore } from '@/stores/shelfStore'
-import { TEMP_ZONES, createEmptyShelfFilter, type Shelf, type TempZone } from '@/types/shelf'
+import {
+  TEMP_ZONES,
+  createEmptyShelfFilter,
+  type Shelf,
+  type ShelfAssignResult,
+  type ShelfOp,
+  type TempZone
+} from '@/types/shelf'
 import { TEMP_RANGE, ZONE_COLOR } from '@/utils/temperature'
 
 const shelfStore = useShelfStore()
@@ -38,6 +45,8 @@ const assignFormRef = ref<FormInstance>()
 const shelfDialogVisible = ref(false)
 const assignDialogVisible = ref(false)
 const editingShelfId = ref<string | null>(null)
+/** 最近一次上架冲突结果：容量被抢时保留原选择并展示冲突，不关闭对话框 */
+const assignConflict = ref<ShelfAssignResult | null>(null)
 
 const shelfForm = reactive({
   room: '',
@@ -190,6 +199,7 @@ async function removeShelf(shelf: Shelf): Promise<void> {
 function openAssignDialog(shelfId?: string): void {
   assignForm.batchId = unassignedBatches.value[0]?.id ?? ''
   assignForm.shelfId = shelfId ?? filteredShelves.value.find((shelf) => (occupancyMap.value[shelf.id]?.free ?? 0) > 0)?.id ?? ''
+  assignConflict.value = null
   assignDialogVisible.value = true
 }
 
@@ -214,7 +224,12 @@ async function submitAssign(): Promise<void> {
   const result = await shelfStore.assignBatch(assignForm.batchId, assignForm.shelfId)
   if (result.ok) {
     ElMessage.success(result.message)
+    assignConflict.value = null
     assignDialogVisible.value = false
+  } else if (result.conflict) {
+    // 容量被抢：保留原选择（批次与窖位都不清空），展示冲突与真实余量，不关闭对话框
+    assignConflict.value = result
+    ElMessage.warning(result.message)
   } else {
     ElMessage.warning(result.message)
   }
@@ -236,10 +251,45 @@ function batchesOnShelf(shelfId: string) {
   return shelfStore.batchesOfShelf(shelfId)
 }
 
+/** 窖位上最近一条未关闭的冲突记录（容量被抢等） */
+function shelfConflict(shelfId: string): ShelfOp | null {
+  return shelfStore.conflictOps.find((op) => op.shelfId === shelfId) ?? null
+}
+
 function batchOptionLabel(batchId: string): string {
   const batch = milkStore.batches.find((item) => item.id === batchId)
   if (!batch) return batchId
   return `${milkStore.milkNameOf(batch.milkId)} · ${batch.cheeseType} ${batch.curdedAt}（${batch.weightKg}kg）`
+}
+
+/** 换架对话框 */
+const changeDialogVisible = ref(false)
+const changeForm = reactive({ batchId: '', shelfId: '' })
+const changeConflict = ref<ShelfAssignResult | null>(null)
+
+function openChangeDialog(batchId: string): void {
+  changeForm.batchId = batchId
+  changeForm.shelfId = ''
+  changeConflict.value = null
+  changeDialogVisible.value = true
+}
+
+async function submitChange(): Promise<void> {
+  if (!changeForm.shelfId) {
+    ElMessage.warning('请选择目标窖位')
+    return
+  }
+  const result = await shelfStore.changeBatch(changeForm.batchId, changeForm.shelfId)
+  if (result.ok) {
+    ElMessage.success(result.message)
+    changeConflict.value = null
+    changeDialogVisible.value = false
+  } else if (result.conflict) {
+    changeConflict.value = result
+    ElMessage.warning(result.message)
+  } else {
+    ElMessage.warning(result.message)
+  }
 }
 </script>
 
@@ -325,8 +375,19 @@ function batchOptionLabel(batchId: string): string {
               <h4>{{ shelf.room }} · {{ shelf.rackNo }}</h4>
               <p class="muted">第 {{ shelf.layerNo }} 层</p>
             </div>
-            <span class="shelf-card__zone" :style="{ backgroundColor: zoneColor(shelf.tempZone) }">
-              {{ shelf.tempZone }}
+            <span class="shelf-card__tags">
+              <el-tag
+                v-if="shelfConflict(shelf.id)"
+                type="danger"
+                effect="dark"
+                size="small"
+                title="容量被抢，提交冲突"
+              >
+                冲突
+              </el-tag>
+              <span class="shelf-card__zone" :style="{ backgroundColor: zoneColor(shelf.tempZone) }">
+                {{ shelf.tempZone }}
+              </span>
             </span>
           </header>
 
@@ -336,6 +397,15 @@ function batchOptionLabel(batchId: string): string {
             </span>
             <span class="muted">余量 {{ occupancyMap[shelf.id]?.free ?? shelf.capacity }} 块</span>
           </div>
+          <el-alert
+            v-if="shelfConflict(shelf.id)"
+            type="error"
+            :closable="false"
+            show-icon
+            class="shelf-card__conflict"
+          >
+            {{ shelfConflict(shelf.id)?.message }}
+          </el-alert>
 
           <el-progress
             :percentage="occupancyMap[shelf.id]?.percent ?? 0"
@@ -353,16 +423,14 @@ function batchOptionLabel(batchId: string): string {
 
           <div class="shelf-card__batches">
             <template v-if="batchesOnShelf(shelf.id).length > 0">
-              <el-tag
-                v-for="batch in batchesOnShelf(shelf.id)"
-                :key="batch.id"
-                type="success"
-                effect="plain"
-                closable
-                @close="release(batch.id)"
-              >
-                {{ milkStore.milkNameOf(batch.milkId) }} · {{ batch.cheeseType }}
-              </el-tag>
+              <span v-for="batch in batchesOnShelf(shelf.id)" :key="batch.id" class="batch-chip">
+                <el-tag type="success" effect="plain" closable @close="release(batch.id)">
+                  {{ milkStore.milkNameOf(batch.milkId) }} · {{ batch.cheeseType }}
+                </el-tag>
+                <el-button text type="primary" size="small" @click="openChangeDialog(batch.id)">
+                  换架
+                </el-button>
+              </span>
             </template>
             <span v-else class="muted">暂无批次</span>
           </div>
@@ -497,6 +565,21 @@ function batchOptionLabel(batchId: string): string {
           </el-select>
         </el-form-item>
       </el-form>
+      <el-alert
+        v-if="assignConflict"
+        type="error"
+        :closable="false"
+        show-icon
+        class="assign-conflict"
+      >
+        <template #title>
+          提交冲突：{{ assignConflict.message }}
+          <span v-if="assignConflict.free !== undefined">
+            （真实余量 {{ assignConflict.free }} / {{ assignConflict.capacity }} 块）
+          </span>
+        </template>
+        原选择已保留，请改选窖位或批次后重新提交；失败操作的占位已释放。
+      </el-alert>
       <el-alert v-if="assignPreview" :type="assignPreview.full ? 'error' : 'success'" :closable="false" show-icon>
         {{ assignPreview.label }}：当前 {{ assignPreview.occupied }} / {{ assignPreview.capacity }} 块，
         上架后 {{ assignPreview.after }} / {{ assignPreview.capacity }} 块（占用率 {{ assignPreview.afterPercent }}%）
@@ -507,6 +590,47 @@ function batchOptionLabel(batchId: string): string {
       <template #footer>
         <el-button @click="assignDialogVisible = false">取消</el-button>
         <el-button type="primary" @click="submitAssign">确认上架</el-button>
+      </template>
+    </el-dialog>
+
+    <el-dialog v-model="changeDialogVisible" title="批次换架" width="520px" destroy-on-close>
+      <el-form label-width="110px">
+        <el-form-item label="批次">
+          <el-input :model-value="batchOptionLabel(changeForm.batchId)" readonly />
+        </el-form-item>
+        <el-form-item label="目标窖位">
+          <el-select v-model="changeForm.shelfId" placeholder="选择新窖位" style="width: 100%">
+            <el-option
+              v-for="shelf in shelves"
+              :key="shelf.id"
+              :label="`${shelfStore.shelfLabel(shelf.id)}（${shelf.tempZone} 余 ${occupancyMap[shelf.id]?.free ?? 0} 块）`"
+              :value="shelf.id"
+              :disabled="(occupancyMap[shelf.id]?.free ?? 0) <= 0"
+            />
+          </el-select>
+        </el-form-item>
+      </el-form>
+      <el-alert
+        v-if="changeConflict"
+        type="error"
+        :closable="false"
+        show-icon
+        class="assign-conflict"
+      >
+        <template #title>
+          提交冲突：{{ changeConflict.message }}
+          <span v-if="changeConflict.free !== undefined">
+            （真实余量 {{ changeConflict.free }} / {{ changeConflict.capacity }} 块）
+          </span>
+        </template>
+        原选择已保留，请改选窖位后重新提交；失败操作的占位已释放。
+      </el-alert>
+      <el-alert v-else type="info" :closable="false" show-icon>
+        换架会在同一事务内释放原窖位并锁定新窖位余量，提交时重新核对容量与批次位置。
+      </el-alert>
+      <template #footer>
+        <el-button @click="changeDialogVisible = false">取消</el-button>
+        <el-button type="primary" @click="submitChange">确认换架</el-button>
       </template>
     </el-dialog>
   </section>
@@ -534,6 +658,22 @@ function batchOptionLabel(batchId: string): string {
   align-items: flex-start;
   justify-content: space-between;
   gap: 8px;
+}
+
+.shelf-card__tags {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.shelf-card__conflict {
+  margin: 4px 0;
+  font-size: 12px;
+}
+
+.assign-conflict {
+  margin-bottom: 12px;
 }
 
 .shelf-card__head h4 {
@@ -566,6 +706,12 @@ function batchOptionLabel(batchId: string): string {
   flex-wrap: wrap;
   gap: 6px;
   min-height: 24px;
+}
+
+.batch-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
 }
 
 .shelf-card__actions {

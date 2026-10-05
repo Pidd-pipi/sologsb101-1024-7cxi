@@ -1,7 +1,7 @@
 import Dexie, { type Table } from 'dexie'
 import type { Milk } from '@/types/milk'
 import type { Batch } from '@/types/batch'
-import type { Shelf } from '@/types/shelf'
+import type { Shelf, ShelfOp } from '@/types/shelf'
 import type { Turning } from '@/types/turning'
 import type { Environment } from '@/types/environment'
 import type { Tasting } from '@/types/tasting'
@@ -11,7 +11,7 @@ import { addDays, diffDays } from '@/utils/temperature'
 export const DB_NAME = 'gbcheeseage'
 
 /** 本地结构版本号：新增/修改表结构时必须递增，并补充 upgrade 迁移 */
-export const DB_VERSION = 2
+export const DB_VERSION = 3
 
 /** localStorage 键名（仅存少量元数据，业务数据一律在 IndexedDB） */
 export const LS_KEYS = {
@@ -70,6 +70,7 @@ export class CheeseAgeDatabase extends Dexie {
   turnings!: Table<Turning, string>
   environments!: Table<Environment, string>
   tastings!: Table<Tasting, string>
+  ops!: Table<ShelfOp, string>
 
   constructor() {
     super(DB_NAME)
@@ -143,6 +144,17 @@ export class CheeseAgeDatabase extends Dexie {
             if (!Number.isFinite(shelf.occupied) || shelf.occupied < 0) shelf.occupied = 0
           })
       })
+    // v3：新增窖位占位 / 冲突记录表 ops。上架、换架、下架统一走同一套事务，
+    // 提交时在事务内重新核对容量与批次当前位置；容量被抢则置 conflict 释放占位。
+    this.version(3).stores({
+      milks: 'id, farm, milkKind, collectedAt, updatedAt',
+      batches: 'id, milkId, shelfId, cheeseType, targetDays, state, curdedAt, updatedAt',
+      shelves: 'id, room, rackNo, tempZone, capacity, occupied, updatedAt',
+      turnings: 'id, batchId, shelfId, doneAt, type, state, seq, updatedAt',
+      environments: 'id, batchId, recordedAt, anomaly, updatedAt',
+      tastings: 'id, batchId, outAt, score, conclusion, updatedAt',
+      ops: 'id, batchId, shelfId, op, status, createdAt, expiresAt'
+    })
   }
 }
 
@@ -158,7 +170,7 @@ export function createId(prefix: string): string {
 export async function clearAllTables(): Promise<void> {
   await db.transaction(
     'rw',
-    [db.milks, db.batches, db.shelves, db.turnings, db.environments, db.tastings],
+    [db.milks, db.batches, db.shelves, db.turnings, db.environments, db.tastings, db.ops],
     async () => {
       await Promise.all([
         db.milks.clear(),
@@ -166,7 +178,8 @@ export async function clearAllTables(): Promise<void> {
         db.shelves.clear(),
         db.turnings.clear(),
         db.environments.clear(),
-        db.tastings.clear()
+        db.tastings.clear(),
+        db.ops.clear()
       ])
     }
   )
